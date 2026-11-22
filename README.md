@@ -74,7 +74,9 @@ Then:
 mlbb start      # or launch "Mobile Legends (Keyboard)" from your app menu
 ```
 
-## Default controls
+## Controls
+
+The keys in the bundled layout:
 
 | Key | Action | | Key | Action |
 |-----|--------|-|-----|--------|
@@ -85,9 +87,28 @@ mlbb start      # or launch "Mobile Legends (Keyboard)" from your app menu
 | `E` | Regen | | `Z` | Quick buy |
 | `Enter` | Chat (typing mode) | | | |
 
-Edit `profiles/mlbb/mapping.json` (or in the scrcpy-mask UI) to rebind. Tap
-coordinates are in the profile's native resolution; see
-[docs/PROFILES.md](docs/PROFILES.md).
+Two things to know before you rely on these:
+
+- You can rebind any key.
+- The on-screen **tap positions are placed for one specific Mobile Legends HUD** (a
+  custom PC-friendly layout). Mobile Legends lets every player move their buttons
+  around, so if yours sit in different spots the taps will miss. That is expected,
+  not a bug: remap them to your own HUD once, as below.
+
+### Remap to your own layout
+
+1. Launch with `mlbb start` so the game and the scrcpy-mask overlay are up.
+2. Run `mlbb remap`. Each binding's label appears on its tap so you can see what
+   you are moving.
+3. In the scrcpy-mask window, open its key-mapping editor and drag each binding
+   onto the matching button in **your** HUD. Add, remove or rebind keys as you like.
+4. Save in scrcpy-mask, then run `mlbb start` again to play (the labels hide
+   automatically).
+
+Tip: arrange your in-game HUD first (Mobile Legends > Settings > Controls >
+Customize), then map the taps onto it. The raw coordinates live in
+`profiles/mlbb/mapping.json`, in the profile's native resolution, if you prefer to
+edit them by hand; see [docs/PROFILES.md](docs/PROFILES.md).
 
 ## Configure
 

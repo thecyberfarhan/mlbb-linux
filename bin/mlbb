@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mlbb-linux: play Mobile Legends (and other Waydroid games) on Linux with a
 # keyboard and mouse, the BlueStacks way, on KDE Plasma (Wayland).
-# Usage: mlbb [start|stop|status|setup|config]
+# Usage: mlbb [start|stop|status|setup|remap|config]
 #
 # Everything game-specific lives in a profile (profiles/<name>/), everything
 # machine-specific in ~/.config/mlbb-linux/config.conf. Nothing here is tied to
@@ -187,6 +187,22 @@ activate_mapping() {
         -d "{\"file\":\"$MAPPING\"}" >>"$LOG" 2>&1
 }
 
+# Show (1) or hide (0) each binding's label on its tap. Hidden while playing;
+# turned on by `mlbb remap` so you can see what you're dragging while you edit.
+set_label_opacity() {
+    local v="$1"
+    if mask_running && mask_api_up; then
+        curl -s -m 3 -X POST "$API/config/update_config" -H 'Content-Type: application/json' \
+            -d "{\"key\":\"mapping_label_opacity\",\"value\":$v}" >>"$LOG" 2>&1
+    elif [ -f "$MASK_CONFIG" ]; then
+        python3 -I - "$MASK_CONFIG" "$v" <<'PY'
+import json, sys
+p, v = sys.argv[1], float(sys.argv[2])
+c = json.load(open(p)); c["mapping_label_opacity"] = v; json.dump(c, open(p, "w"), indent=2)
+PY
+    fi
+}
+
 # Checks every piece, repairing what it can. Prints one line per problem left.
 verify_all() {
     local problems=()
@@ -266,6 +282,7 @@ start() {
         wait_for 15 mask_controlling || fail "scrcpy-mask couldn't connect to Android. See $LOG"
     fi
     activate_mapping
+    set_label_opacity 0      # hide the key labels while playing
 
     "$ADB" -s "$SERIAL" shell am start -n "$PKG/$ACTIVITY" >>"$LOG" 2>&1
     local n
@@ -343,6 +360,34 @@ setup() {
     echo "Then launch with:   mlbb start"
 }
 
+# Put the keymapper into an editable state so you can move the on-screen taps onto
+# YOUR Mobile Legends HUD. The shipped positions match one specific custom HUD, so
+# everyone needs to do this once for their own layout.
+remap() {
+    require_setup
+    if ! mask_api_up; then
+        echo "Start the game first:  mlbb start"
+        echo "Then run  mlbb remap  to edit your controls."
+        exit 1
+    fi
+    set_label_opacity 1
+    say "Edit mode on: each key's label is now shown on its tap."
+    cat <<'EOF'
+
+Remap your controls to your own Mobile Legends HUD:
+  1. In the scrcpy-mask window, open its key-mapping editor (its toolbar / edit
+     button).
+  2. Drag each binding onto the matching button in YOUR in-game HUD. Add, remove
+     or rebind keys however you like.
+  3. Save in scrcpy-mask.
+  4. Run  mlbb start  again to play (the labels hide automatically).
+
+Tip: arrange your in-game HUD first (Mobile Legends > Settings > Controls >
+Customize), then map the taps onto it. The raw coordinates live in the active
+profile's mapping.json if you would rather edit them by hand.
+EOF
+}
+
 config_cmd() {
     case "${1:-show}" in
         show)
@@ -365,6 +410,7 @@ case "${1:-start}" in
     stop) stop ;;
     status) status ;;
     setup) setup ;;
+    remap) remap ;;
     config) shift; config_cmd "$@" ;;
-    *) echo "Usage: mlbb [start|stop|status|setup|config]"; exit 2 ;;
+    *) echo "Usage: mlbb [start|stop|status|setup|remap|config]"; exit 2 ;;
 esac

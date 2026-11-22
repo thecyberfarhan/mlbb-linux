@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `mlbb remap`: show the key labels and walk you through moving the on-screen taps
+  onto your own Mobile Legends HUD, since the bundled positions match one specific
+  custom layout. `mlbb start` now hides the labels for play.
+
 ## 1.0.0
 
 First public release. Play Mobile Legends on Linux (Waydroid) with a keyboard and
