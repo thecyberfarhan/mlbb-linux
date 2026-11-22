@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Mobile Legends (Keyboard)
+GenericName=MOBA with keyboard mapping
+Comment=Mobile Legends in Waydroid with WASD keymapping, supersampling and smooth video
+Exec=@@BIN@@/mlbb start
+Icon=@@ICON@@
+Terminal=false
+StartupWMClass=scrcpy-mask
+Categories=Game;
+Keywords=mlbb;mobile legends;waydroid;keyboard;
+Actions=stop;
+
+[Desktop Action stop]
+Name=Stop (close game, keymapper and Android)
+Exec=@@BIN@@/mlbb stop

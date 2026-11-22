@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Log CPU / RAM / GPU / FPS every few seconds while the game runs in Waydroid.
+
+Usage: mlbb-perf [interval_seconds]   (Ctrl-C to stop; CSV goes to ~/.local/state/mlbb/)
+
+Optional, for tuning only. The Android serial comes from MLBB_SERIAL (set by the
+launcher) or is auto-detected; the GPU sysfs node is auto-detected (AMD fields are
+best-effort and blank out on other GPUs); the game's main thread name comes from
+MLBB_MAIN_THREAD (default UnityMain, a Unity game).
+"""
+import csv
+import glob
+import os
+import subprocess
+import sys
+import time
+
+
+def detect_serial():
+    s = os.environ.get("MLBB_SERIAL")
+    if s:
+        return s
+    try:
+        out = subprocess.run(["waydroid", "status"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "IP address" in line:
+                ip = line.split("\t")[-1].strip()
+                if ip.count(".") == 3 and all(p.isdigit() for p in ip.split(".")):
+                    return f"{ip}:5555"
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return "127.0.0.1:5555"
+
+
+def detect_gpu_dir():
+    # The DRM card whose device exposes gpu_busy_percent (amdgpu and others).
+    for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+        dev = os.path.join(card, "device")
+        if os.path.exists(os.path.join(dev, "gpu_busy_percent")):
+            return dev
+    return ""
+
+
+def hwmon_named(name):
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(f"{h}/name").read().strip() == name:
+                return h
+        except OSError:
+            pass
+    return None
+
+
+MASK_DIR = os.environ.get("MLBB_SCRCPY_MASK_DIR") or os.path.expanduser("~/.local/share/scrcpy-mask/app")
+ADB = os.path.join(MASK_DIR, "assets/platform-tools/adb")
+SERIAL = detect_serial()
+MAIN_THREAD = os.environ.get("MLBB_MAIN_THREAD", "UnityMain")
+PKG_HINT = os.environ.get("MLBB_PKG", "mobile.legends")
+GPU = detect_gpu_dir()
+GPU_HWMON = hwmon_named("amdgpu")
+CPU_HWMON = hwmon_named("coretemp") or hwmon_named("k10temp")
+INTERVAL = float(sys.argv[1]) if len(sys.argv) > 1 else 2.0
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def cpu_times():
+    out = {}
+    for line in read("/proc/stat").splitlines():
+        if line.startswith("cpu") and line[3:4].isdigit():
+            f = line.split()
+            vals = list(map(int, f[1:9]))
+            out[f[0]] = (sum(vals), vals[3] + vals[4])
+    return out
+
+
+def game_pid():
+    for comm in glob.glob("/proc/[0-9]*/task/*/comm"):
+        if read(comm) == MAIN_THREAD:
+            return comm.split("/")[2]
+    return None
+
+
+def thread_ticks(pid):
+    ticks = {}
+    for stat in glob.glob(f"/proc/{pid}/task/*/stat"):
+        s = read(stat)
+        if not s:
+            continue
+        name = s[s.find("(") + 1:s.rfind(")")]
+        f = s[s.rfind(")") + 2:].split()
+        ticks[stat.split("/")[4]] = (name, int(f[11]) + int(f[12]))
+    return ticks
+
+
+def fps():
+    if not GPU and not os.path.exists(ADB):
+        return ""
+    try:
+        layers = subprocess.run([ADB, "-s", SERIAL, "shell", "dumpsys SurfaceFlinger --list"],
+                                capture_output=True, text=True, timeout=3).stdout
+        layer = next((l.strip() for l in layers.splitlines() if PKG_HINT in l and "(BLAST)" in l), None)
+        if not layer:
+            return ""
+        out = subprocess.run([ADB, "-s", SERIAL, "shell", f"dumpsys SurfaceFlinger --latency '{layer}'"],
+                             capture_output=True, text=True, timeout=3).stdout.split("\n")[1:]
+        stamps = [int(l.split()[1]) for l in out if len(l.split()) == 3 and 0 < int(l.split()[1]) < 2**62]
+        now = time.monotonic_ns()
+        recent = [t for t in stamps if now - t < INTERVAL * 1e9 * 1.5]
+        if len(recent) < 2:
+            return "0"
+        return f"{(len(recent) - 1) / ((recent[-1] - recent[0]) / 1e9):.0f}"
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return ""
+
+
+def gpu_sclk():
+    if not GPU:
+        return ""
+    for line in read(f"{GPU}/pp_dpm_sclk").splitlines():
+        if "*" in line:
+            return line.split()[1].rstrip("Mhz")
+    return ""
+
+
+def mem():
+    info = {l.split(":")[0]: int(l.split()[1]) for l in read("/proc/meminfo").splitlines() if l.split()[1].isdigit()}
+    used = (info["MemTotal"] - info["MemAvailable"]) // 1024
+    swap = (info["SwapTotal"] - info["SwapFree"]) // 1024
+    return used, swap
+
+
+def main():
+    out_dir = os.path.expanduser(os.path.join(os.environ.get("XDG_STATE_HOME", "~/.local/state"), "mlbb"))
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, time.strftime("perf-%Y%m%d-%H%M%S.csv"))
+    cols = ["time", "fps", "cpu_total%", "cpu_busiest_core%", "cpu_mhz_avg", "cpu_temp_c",
+            "game_cpu%", "top_thread", "top_thread%", "thread2", "thread2%", "thread3", "thread3%",
+            "ram_used_mb", "swap_used_mb", "gpu_busy%", "gpu_mhz", "vram_mb", "gpu_temp_c"]
+    print(f"Logging to {path} every {INTERVAL}s. Ctrl-C to stop.", flush=True)
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        prev_cpu, pid = cpu_times(), game_pid()
+        prev_thr = thread_ticks(pid) if pid else {}
+        t0 = time.monotonic()
+        while True:
+            time.sleep(INTERVAL)
+            dt = time.monotonic() - t0
+            t0 = time.monotonic()
+            cur = cpu_times()
+            loads = []
+            for c, (tot, idle) in cur.items():
+                ptot, pidle = prev_cpu.get(c, (tot, idle))
+                loads.append(100 * (1 - (idle - pidle) / max(tot - ptot, 1)))
+            prev_cpu = cur
+
+            if not pid or not os.path.exists(f"/proc/{pid}"):
+                pid = game_pid()
+                prev_thr = thread_ticks(pid) if pid else {}
+            thr = thread_ticks(pid) if pid else {}
+            deltas = sorted(((n, 100 * (t - prev_thr.get(tid, (n, t))[1]) / CLK_TCK / dt)
+                             for tid, (n, t) in thr.items()), key=lambda x: -x[1])
+            prev_thr = thr
+            top = (deltas + [("", 0.0)] * 3)[:3]
+
+            mhz = [int(read(p, "0")) // 1000 for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")]
+            used, swap = mem()
+            row = [time.strftime("%H:%M:%S"), fps(),
+                   f"{sum(loads) / len(loads):.0f}", f"{max(loads):.0f}", sum(mhz) // max(len(mhz), 1),
+                   int(read(f"{CPU_HWMON}/temp1_input", "0")) // 1000 if CPU_HWMON else "",
+                   f"{sum(d for _, d in deltas):.0f}",
+                   top[0][0], f"{top[0][1]:.0f}", top[1][0], f"{top[1][1]:.0f}", top[2][0], f"{top[2][1]:.0f}",
+                   used, swap, read(f"{GPU}/gpu_busy_percent") if GPU else "", gpu_sclk(),
+                   int(read(f"{GPU}/mem_info_vram_used", "0")) // 1048576 if GPU else "",
+                   int(read(f"{GPU_HWMON}/temp1_input", "0")) // 1000 if GPU_HWMON else ""]
+            w.writerow(row)
+            fh.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

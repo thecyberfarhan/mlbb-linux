@@ -1,0 +1,6 @@
+# mlbb-linux: let members of the "input" group use /dev/uinput, which the
+# on-screen controls need to send a virtual Enter key (chat) and a virtual
+# right-click (leave typing mode). Installed to /etc/udev/rules.d/ by install.sh.
+# Your distro may already ship an equivalent rule (ydotool, steam-devices); this
+# is here so the tool does not depend on those being present.
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

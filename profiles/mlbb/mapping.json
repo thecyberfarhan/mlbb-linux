@@ -1,0 +1,194 @@
+{
+  "version": "0.0.1",
+  "original_size": {
+    "width": 1920,
+    "height": 1080
+  },
+  "mappings": [
+    {
+      "type": "DirectionPad",
+      "id": "mlbbjoy1",
+      "note": "Joystick",
+      "pointer_id": 1,
+      "position": {
+        "x": 110,
+        "y": 963
+      },
+      "initial_duration": 0,
+      "max_offset_x": 90.0,
+      "max_offset_y": 90.0,
+      "enable_randomization": false,
+      "random_offset_x": 0.0,
+      "random_offset_y": 0.0,
+      "random_distance_min_scale": 1.0,
+      "random_distance_max_scale": 1.0,
+      "jitter_offset_x": 0.0,
+      "jitter_offset_y": 0.0,
+      "up_boost_key": null,
+      "up_boost_scale": 1.0,
+      "bind": {
+        "type": "Button",
+        "up": [
+          "KeyW"
+        ],
+        "down": [
+          "KeyS"
+        ],
+        "left": [
+          "KeyA"
+        ],
+        "right": [
+          "KeyD"
+        ]
+      }
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0001",
+      "note": "Attack",
+      "position": {
+        "x": 1840,
+        "y": 1010
+      },
+      "pointer_id": 2,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "Space"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0002",
+      "note": "Flicker",
+      "position": {
+        "x": 1785,
+        "y": 953
+      },
+      "pointer_id": 3,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "ShiftLeft"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0003",
+      "note": "Regen",
+      "position": {
+        "x": 1837,
+        "y": 913
+      },
+      "pointer_id": 4,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "KeyE"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0004",
+      "note": "Recall",
+      "position": {
+        "x": 1750,
+        "y": 1017
+      },
+      "pointer_id": 5,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "KeyQ"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0005",
+      "note": "Extra spell",
+      "position": {
+        "x": 1675,
+        "y": 1035
+      },
+      "pointer_id": 6,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "AltLeft"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0006",
+      "note": "Scoreboard",
+      "position": {
+        "x": 958,
+        "y": 14
+      },
+      "pointer_id": 7,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "Tab"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0007",
+      "note": "Shop",
+      "position": {
+        "x": 1877,
+        "y": 15
+      },
+      "pointer_id": 8,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "ControlLeft"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "SingleTap",
+      "id": "mlbb0008",
+      "note": "Quick buy",
+      "position": {
+        "x": 1824,
+        "y": 73
+      },
+      "pointer_id": 9,
+      "duration": 50,
+      "sync": true,
+      "bind": [
+        "KeyZ"
+      ],
+      "random_offset_x": 4.0,
+      "random_offset_y": 4.0
+    },
+    {
+      "type": "RawInput",
+      "id": "mlbbchat",
+      "note": "Chat typing mode",
+      "position": {
+        "x": 1899,
+        "y": 210
+      },
+      "bind": [
+        "Enter"
+      ]
+    }
+  ]
+}

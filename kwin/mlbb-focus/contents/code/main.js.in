@@ -1,0 +1,114 @@
+// mlbb-linux KWin script. Installed to
+// ~/.local/share/kwin/scripts/mlbb-focus/contents/code/main.js with @@GAME_WIDTH@@
+// and @@GAME_HEIGHT@@ substituted by `mlbb setup` from the active profile.
+//
+// It does four things while you play:
+//   1. keeps the Waydroid game window and the scrcpy-mask overlay above other
+//      windows ONLY while the overlay is focused (so Meta still shows the taskbar),
+//   2. keeps the overlay stacked directly above the game so clicks/keys never miss,
+//   3. pins the overlay 2px larger than the game monitor so scrcpy-mask's 1px
+//      border falls off-screen, re-placing it when monitors change,
+//   4. syncs minimize between the overlay and the (taskbar-hidden) game window,
+//      and prints MLBB_FOCUS in/out for mlbb-controls to read.
+var GAME_W = @@GAME_WIDTH@@;
+var GAME_H = @@GAME_HEIGHT@@;
+
+function byClass(cls) {
+    return workspace.windowList().filter(function (w) { return w.resourceClass === cls; });
+}
+
+// The game monitor is the landscape GAME_W x GAME_H output, wherever it sits.
+// The overlay is 2px larger on every side so scrcpy-mask's 1px border is off-screen.
+var MASK_GEO = {x: -2, y: -1, width: GAME_W + 4, height: GAME_H + 2};
+
+function updateMaskGeo() {
+    var screens = workspace.screens;
+    for (var i = 0; i < screens.length; i++) {
+        var g = screens[i].geometry;
+        if (g.width === GAME_W && g.height === GAME_H) {
+            MASK_GEO = {x: g.x - 2, y: g.y - 1, width: GAME_W + 4, height: GAME_H + 2};
+            return;
+        }
+    }
+}
+updateMaskGeo();
+
+function placeMask(w) {
+    var g = w.frameGeometry;
+    if (g.x !== MASK_GEO.x || g.y !== MASK_GEO.y || g.width !== MASK_GEO.width || g.height !== MASK_GEO.height) {
+        w.frameGeometry = MASK_GEO;
+    }
+}
+
+var lastFocused = null;
+
+function update() {
+    var active = workspace.activeWindow;
+    var focused = !!active && active.resourceClass === "scrcpy-mask";
+    // Read by mlbb-controls: scrcpy-mask leaves typing mode when it loses and regains focus.
+    if (focused !== lastFocused) {
+        print("MLBB_FOCUS " + (focused ? "in" : "out"));
+        lastFocused = focused;
+    }
+    var games = byClass("Waydroid");
+    var masks = byClass("scrcpy-mask");
+    games.forEach(function (w) { w.keepAbove = focused; });
+    masks.forEach(function (w) { w.keepAbove = focused; placeMask(w); });
+    if (focused) {
+        games.forEach(function (w) { workspace.raiseWindow(w); });
+        masks.forEach(function (w) { workspace.raiseWindow(w); });
+    }
+}
+
+// The overlay must always sit directly above the game window, or clicks/keys miss it.
+function keepMaskAboveGame() {
+    var order = workspace.stackingOrder;
+    var topGame = -1, lowMask = -1;
+    for (var i = 0; i < order.length; i++) {
+        var c = order[i].resourceClass;
+        if (c === "Waydroid") topGame = i;
+        if (c === "scrcpy-mask" && lowMask < 0) lowMask = i;
+    }
+    if (topGame >= 0 && lowMask >= 0 && lowMask < topGame) {
+        byClass("scrcpy-mask").forEach(function (w) { workspace.raiseWindow(w); });
+    }
+}
+
+workspace.windowActivated.connect(update);
+workspace.windowAdded.connect(function (w) {
+    if (w.resourceClass === "Waydroid" || w.resourceClass === "scrcpy-mask") { update(); keepMaskAboveGame(); }
+});
+function watch(w) {
+    if (w.resourceClass !== "Waydroid" && w.resourceClass !== "scrcpy-mask") return;
+    if (w.stackingOrderChanged) w.stackingOrderChanged.connect(keepMaskAboveGame);
+    if (w.resourceClass === "scrcpy-mask") {
+        // scrcpy-mask resizes itself on connect and KWin re-clamps it; put it back, but give up
+        // after a few tries so a compositor that refuses the position can't cause a loop.
+        var tries = 0;
+        w.frameGeometryChanged.connect(function () {
+            var g = w.frameGeometry;
+            if (g.x === MASK_GEO.x && g.y === MASK_GEO.y && g.width === MASK_GEO.width && g.height === MASK_GEO.height) {
+                tries = 0;
+                return;
+            }
+            if (tries++ < 5) placeMask(w);
+        });
+        // The overlay is the game's only taskbar entry, so minimizing/restoring it from the
+        // taskbar must take the (hidden-from-taskbar) Waydroid window along with it.
+        w.minimizedChanged.connect(function () {
+            byClass("Waydroid").forEach(function (g) { g.minimized = w.minimized; });
+            if (!w.minimized) {
+                update();
+                keepMaskAboveGame();
+            }
+        });
+    }
+}
+workspace.screensChanged.connect(function () {
+    updateMaskGeo();
+    byClass("scrcpy-mask").forEach(placeMask);
+});
+workspace.windowList().forEach(watch);
+workspace.windowAdded.connect(watch);
+update();
+keepMaskAboveGame();

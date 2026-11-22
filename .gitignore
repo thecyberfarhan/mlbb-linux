@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Rendered-at-install artifacts (templates live as *.in in the repo)
+kwin/mlbb-focus/contents/code/main.js
+*.desktop
+
+# Local editor / OS noise
+.DS_Store
+*.swp

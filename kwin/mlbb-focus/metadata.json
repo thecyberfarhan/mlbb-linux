@@ -1,0 +1,11 @@
+{
+    "KPlugin": {
+        "Id": "mlbb-focus",
+        "Name": "MLBB game focus",
+        "Description": "Keeps Waydroid + scrcpy-mask above the taskbar only while the game is focused",
+        "Version": "1.0",
+        "License": "MIT"
+    },
+    "X-Plasma-API": "javascript",
+    "KPackageStructure": "KWin/Script"
+}

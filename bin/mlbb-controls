@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""On-screen control bar for mlbb-linux: minimize / chat / game HUD buttons.
+
+A layer-shell overlay at the mid-left of the game monitor. It never takes keyboard
+focus and is shown only while the game overlay (scrcpy-mask) has focus (the
+mlbb-focus KWin script prints "MLBB_FOCUS in/out" to the journal). Fully
+transparent until the cursor hovers it.
+
+  minimize  minimize the game (the KWin script minimizes Waydroid along with scrcpy-mask)
+  chat      enter scrcpy-mask's typing mode by tapping a virtual Enter (/dev/uinput)
+  game      leave typing mode via scrcpy-mask's own exit (hold virtual right-click
+            >= 1s); reconnecting the device is only a fallback, because it can drop
+            a held touch and leave the joystick stuck
+
+The current mode is read from scrcpy-mask's log, so it stays correct however the
+mode was changed. A watchdog releases touches Android still holds when nothing is
+physically pressed. Everything machine-specific comes from the environment that
+`mlbb` exports (MLBB_SERIAL, MLBB_MONITOR, MLBB_GAME_WIDTH/HEIGHT,
+MLBB_SCRCPY_MASK_DIR, MLBB_WATCHDOG_IGNORE); sensible fallbacks apply if run alone.
+"""
+import fcntl
+import glob
+import json
+import os
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+# Must be set before Qt creates the platform integration.
+os.environ["QT_WAYLAND_SHELL_INTEGRATION"] = "layer-shell"
+
+from PyQt6.QtCore import QObject, QSocketNotifier, QTimer, pyqtProperty, pyqtSignal, pyqtSlot  # noqa: E402
+from PyQt6.QtGui import QGuiApplication  # noqa: E402
+from PyQt6.QtQml import QQmlApplicationEngine  # noqa: E402
+
+
+def _detect_serial():
+    """Fall back to Waydroid's current IP if MLBB_SERIAL wasn't passed in."""
+    try:
+        out = subprocess.run(["waydroid", "status"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "IP address" in line:
+                ip = line.split("\t")[-1].strip()
+                parts = ip.split(".")
+                if len(parts) == 4 and all(p.isdigit() for p in parts):
+                    return f"{ip}:5555"
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+MONITOR = os.environ.get("MLBB_MONITOR", "")
+SERIAL = os.environ.get("MLBB_SERIAL") or _detect_serial()
+GAME_W = int(os.environ.get("MLBB_GAME_WIDTH", "1920"))
+GAME_H = int(os.environ.get("MLBB_GAME_HEIGHT", "1080"))
+MASK_DIR = os.environ.get("MLBB_SCRCPY_MASK_DIR") or os.path.expanduser("~/.local/share/scrcpy-mask/app")
+ADB = os.path.join(MASK_DIR, "assets/platform-tools/adb")
+MASK_BIN = os.path.join(MASK_DIR, "scrcpy-mask")
+API = "http://127.0.0.1:27799/api"
+STATE_DIR = os.path.expanduser(os.path.join(os.environ.get("XDG_STATE_HOME", "~/.local/state"), "mlbb"))
+MASK_LOG = os.path.expanduser("~/.local/share/com.akichase.scrcpy-mask/app.log")
+MLBB_BIN = os.path.expanduser("~/.local/bin/mlbb")
+
+# Input devices the stuck-touch watchdog must never count as "a key is held":
+# virtual devices (ours and others') can sit with a key bit set forever and would
+# otherwise block the watchdog. Matched as case-insensitive substrings of the
+# device name, plus anything in MLBB_WATCHDOG_IGNORE.
+VIRTUAL_DEVICE_HINTS = ["uinput", "rustdesk", "mouce", "mlbb-controls", "ydotool", "virtual"]
+VIRTUAL_DEVICE_HINTS += [s for s in os.environ.get("MLBB_WATCHDOG_IGNORE", "").lower().split() if s]
+
+QML = r"""
+import QtQuick
+import QtQuick.Window
+import QtQuick.Shapes
+import QtQuick.Effects
+import org.kde.layershell 1.0 as LayerShell
+
+Window {
+    id: root
+    width: row.width + 20; height: row.height + 20
+    visible: false
+    color: "transparent"
+    flags: Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus
+
+    screen: targetScreen
+    LayerShell.Window.screen: targetScreen
+    LayerShell.Window.layer: LayerShell.Window.LayerOverlay
+    // Anchored to the left edge only, so the compositor centres it vertically (mid-left).
+    LayerShell.Window.anchors: LayerShell.Window.AnchorLeft
+    LayerShell.Window.keyboardInteractivity: LayerShell.Window.KeyboardInteractivityNone
+    LayerShell.Window.exclusionZone: -1
+    LayerShell.Window.activateOnShow: false
+    LayerShell.Window.scope: "mlbb-controls"
+
+    // Colours taken from the in-match HUD buttons (dark glassy circles, thin light rings).
+    readonly property color glass: Qt.rgba(0, 0, 0, 0.42)
+    readonly property color glassHover: Qt.rgba(0.05, 0.09, 0.16, 0.6)
+    readonly property color ring: Qt.rgba(1, 1, 1, 0.38)
+    readonly property color ringActive: "#7fe6ff"
+    readonly property color chatBlue: "#86ccf7"
+    readonly property color swordGold: "#f2c454"
+
+    component HudButton: Item {
+        id: btn
+        property string kind            // "min" | "chat" | "game"
+        property bool active: false
+        property bool busy: false
+        signal clicked()
+        width: 40; height: 40
+        scale: ma.pressed ? 0.9 : 1.0
+        Behavior on scale { NumberAnimation { duration: 80 } }
+
+        QtObject { id: pulse; property real v: 0 }
+        SequentialAnimation {
+            running: btn.busy; loops: Animation.Infinite
+            NumberAnimation { target: pulse; property: "v"; from: 0.25; to: 1; duration: 320 }
+            NumberAnimation { target: pulse; property: "v"; from: 1; to: 0.25; duration: 320 }
+        }
+
+        Rectangle {
+            id: disc
+            anchors.fill: parent
+            radius: width / 2
+            color: ma.containsMouse ? root.glassHover : root.glass
+            border.width: btn.active ? 2 : 1.4
+            border.color: btn.busy ? Qt.rgba(0.5, 0.9, 1, pulse.v)
+                                   : (btn.active ? root.ringActive : (ma.containsMouse ? Qt.rgba(1, 1, 1, 0.7) : root.ring))
+            layer.enabled: btn.active
+            layer.effect: MultiEffect {
+                shadowEnabled: true
+                shadowColor: "#40d8ff"
+                shadowBlur: 0.6
+                shadowOpacity: 0.9
+                shadowHorizontalOffset: 0
+                shadowVerticalOffset: 0
+                blurMax: 18
+            }
+        }
+
+        // Faint inner rim, like the bevel on the game's HUD discs.
+        Rectangle {
+            anchors.fill: parent; anchors.margins: 3
+            radius: width / 2
+            color: "transparent"
+            border.width: 1
+            border.color: Qt.rgba(1, 1, 1, 0.07)
+        }
+
+        // --- icons -----------------------------------------------------------
+        Rectangle {                     // minimize
+            visible: btn.kind === "min"
+            anchors.centerIn: parent; anchors.verticalCenterOffset: 5
+            width: 14; height: 3; radius: 1.5
+            color: "white"
+        }
+
+        Item {                          // chat bubble with a smile, like the game's chat button
+            visible: btn.kind === "chat"
+            width: 22; height: 20
+            anchors.centerIn: parent; anchors.verticalCenterOffset: 1
+            Shape {
+                anchors.fill: parent
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    fillColor: root.chatBlue
+                    strokeColor: "transparent"
+                    PathSvg { path: "M 4 1 L 18 1 Q 21 1 21 4 L 21 12 Q 21 15 18 15 L 11 15 L 6 19 L 7 15 L 4 15 Q 1 15 1 12 L 1 4 Q 1 1 4 1 Z" }
+                }
+            }
+            Rectangle { x: 6.5; y: 6; width: 2.4; height: 2.4; radius: 1.2; color: "#1d3b57" }
+            Rectangle { x: 13.1; y: 6; width: 2.4; height: 2.4; radius: 1.2; color: "#1d3b57" }
+            Shape {
+                anchors.fill: parent
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    fillColor: "transparent"; strokeColor: "#1d3b57"; strokeWidth: 1.6
+                    capStyle: ShapePath.RoundCap
+                    PathSvg { path: "M 7.5 10.3 Q 11 12.8 14.5 10.3" }
+                }
+            }
+        }
+
+        Shape {                         // crossed swords
+            visible: btn.kind === "game"
+            width: 22; height: 22
+            anchors.centerIn: parent
+            preferredRendererType: Shape.CurveRenderer
+            ShapePath {                 // blades
+                fillColor: "transparent"; strokeColor: root.swordGold; strokeWidth: 2.4
+                capStyle: ShapePath.RoundCap
+                PathSvg { path: "M 3 3 L 15.5 15.5 M 19 3 L 6.5 15.5" }
+            }
+            ShapePath {                 // guards and grips
+                fillColor: "transparent"; strokeColor: Qt.darker(root.swordGold, 1.25); strokeWidth: 2.2
+                capStyle: ShapePath.RoundCap
+                PathSvg { path: "M 12.5 18.5 L 18.5 12.5 M 9.5 18.5 L 3.5 12.5 M 16.5 16.5 L 19.5 19.5 M 5.5 16.5 L 2.5 19.5" }
+            }
+        }
+
+        MouseArea { id: ma; anchors.fill: parent; hoverEnabled: true; onClicked: btn.clicked() }
+    }
+
+    // Invisible until the cursor reaches the edge; fades in on hover.
+    Item {
+        id: group
+        anchors.fill: parent
+        opacity: cornerHover.hovered ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+        HoverHandler { id: cornerHover }
+
+        Row {
+            id: row
+            x: 10; y: 10
+            spacing: 10
+            HudButton { kind: "min"; onClicked: controller.minimize() }
+            HudButton { kind: "chat"; active: controller.mode === "chat"; onClicked: controller.chat() }
+            HudButton { kind: "game"; active: controller.mode === "game"; busy: controller.busy; onClicked: controller.game() }
+        }
+    }
+}
+"""
+
+# --- virtual input devices (/dev/uinput) --------------------------------------------------------
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT = 0x40045564, 0x40045565, 0x40045566
+UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405c5503, 0x5501, 0x5502
+EV_SYN, EV_KEY, EV_REL = 0, 1, 2
+KEY_ENTER, BTN_LEFT, BTN_RIGHT, REL_X, REL_Y = 28, 0x110, 0x111, 0, 1
+
+
+class VirtualInput:
+    def __init__(self, name, product, keys, rel_axes=()):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        for k in keys:
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, k)
+        if rel_axes:  # libinput only treats a device as a pointer if it has relative axes
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+            for axis in rel_axes:
+                fcntl.ioctl(self.fd, UI_SET_RELBIT, axis)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("HHHH80sI", 0x03, 0x1234, product, 1, name.encode(), 0))
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def key(self, code, value):
+        os.write(self.fd, struct.pack("llHHi", 0, 0, EV_KEY, code, value))
+        os.write(self.fd, struct.pack("llHHi", 0, 0, EV_SYN, 0, 0))
+
+    def tap(self, code):
+        for value in (1, 0):
+            self.key(code, value)
+            time.sleep(0.03)
+
+    def close(self):
+        fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        os.close(self.fd)
+
+
+def run_kwin_js(name, code):
+    path = os.path.join(STATE_DIR, f"{name}.js")
+    with open(path, "w") as f:
+        f.write(code)
+    sid = subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", path, name],
+                         capture_output=True, text=True).stdout.strip()
+    if sid:
+        subprocess.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"], capture_output=True)
+    subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", name], capture_output=True)
+
+
+def cancel_android_touches():
+    subprocess.run([ADB, "-s", SERIAL, "shell", "input", "touchscreen", "motionevent", "CANCEL", "0", "0"],
+                   capture_output=True, timeout=5)
+
+
+def android_touch_down():
+    out = subprocess.run([ADB, "-s", SERIAL, "shell", "dumpsys input | grep -m1 -A1 TouchStates"],
+                         capture_output=True, text=True, timeout=5).stdout
+    return "down=true" in out
+
+
+EVIOCGKEY_96 = (2 << 30) | (96 << 16) | (0x45 << 8) | 0x18  # read the currently-pressed key bitmap
+
+
+def _device_name(event_path):
+    base = os.path.basename(event_path)
+    try:
+        with open(f"/sys/class/input/{base}/device/name") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+class HeldInputs:
+    """Whether any key or mouse button is physically held on a REAL input device.
+
+    Virtual devices (ours, RustDesk, fake-mouse libraries) can sit with a key bit
+    set forever, which would wedge the watchdog, so they are skipped by name.
+    """
+
+    def __init__(self):
+        self.fds, self.scanned = [], 0.0
+
+    def _rescan(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+        for path in glob.glob("/dev/input/event*"):
+            name = _device_name(path).lower()
+            if any(hint in name for hint in VIRTUAL_DEVICE_HINTS):
+                continue
+            try:
+                self.fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+        self.scanned = time.monotonic()
+
+    def any_held(self):
+        if time.monotonic() - self.scanned > 15:  # pick up plugged/unplugged devices
+            self._rescan()
+        buf = bytearray(96)
+        for fd in self.fds:
+            try:
+                fcntl.ioctl(fd, EVIOCGKEY_96, buf)
+            except OSError:
+                continue
+            if any(buf):
+                return True
+        return False
+
+
+def stuck_touch_watchdog(controller):
+    """Release touches Android still holds when nothing is physically pressed.
+
+    Every touch the game gets comes from a held key or mouse button, so a touch that
+    stays down for 2+ seconds while nothing real is held is orphaned (a dropped
+    release). Never acts while anything is held.
+    """
+    held, strikes = HeldInputs(), 0
+    while True:
+        time.sleep(1.0)
+        try:
+            if not controller.game_focused or controller.busy or held.any_held():
+                strikes = 0
+                continue
+            if not android_touch_down():
+                strikes = 0
+                continue
+            strikes += 1
+            if strikes >= 2 and not held.any_held():
+                cancel_android_touches()
+                print(f"[{time.strftime('%F %T')}] watchdog: released an orphaned touch "
+                      f"(mode={controller.mode})", file=sys.stderr, flush=True)
+                strikes = 0
+        except Exception as e:  # adb hiccups must never kill the helper
+            print(f"watchdog: {e}", file=sys.stderr, flush=True)
+            strikes = 0
+
+
+def api_post(path, payload):
+    req = urllib.request.Request(f"{API}/{path}", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.read()
+
+
+class LineReader:
+    """Splits raw bytes from a pipe into lines (QSocketNotifier only fires on new data)."""
+
+    def __init__(self, proc, handler):
+        self.fd, self.handler, self.buf = proc.stdout.fileno(), handler, b""
+        self.notifier = QSocketNotifier(self.fd, QSocketNotifier.Type.Read)
+        self.notifier.activated.connect(self.read)
+
+    def read(self):
+        data = os.read(self.fd, 65536)
+        if not data:
+            self.notifier.setEnabled(False)
+            return
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        for line in lines:
+            self.handler(line.decode(errors="replace"))
+
+
+class Controller(QObject):
+    modeChanged = pyqtSignal()
+    busyChanged = pyqtSignal()
+
+    def __init__(self, keys, mouse):
+        super().__init__()
+        self.window = None
+        self.keys = keys
+        self.mouse = mouse
+        self._mode = "game"
+        self._busy = False
+        self.focus_lost_in_chat = False
+        self.game_focused = False
+        self.hold_hidden = False  # bar hidden while the virtual right-click is held over the game
+        # scrcpy-mask log lines start with an ISO UTC timestamp; anything older is replayed history.
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+    @pyqtProperty(str, notify=modeChanged)
+    def mode(self):
+        return self._mode
+
+    def set_mode(self, mode):
+        if mode != self._mode:
+            self._mode = mode
+            self.modeChanged.emit()
+
+    @pyqtProperty(bool, notify=busyChanged)
+    def busy(self):
+        return self._busy
+
+    def set_busy(self, busy):
+        if busy != self._busy:
+            self._busy = busy
+            self.busyChanged.emit()
+
+    @pyqtSlot()
+    def minimize(self):
+        self.window.setVisible(False)
+        run_kwin_js("mlbb_minimize_once",
+                    'for (const w of workspace.windowList()) if (w.resourceClass === "scrcpy-mask") w.minimized = true;\n')
+
+    @pyqtSlot()
+    def chat(self):
+        if self._mode == "chat":
+            return
+        # scrcpy-mask has keyboard focus while this bar is visible, so the virtual Enter reaches it.
+        self.keys.tap(KEY_ENTER)
+
+    @pyqtSlot()
+    def game(self):
+        """Leave typing mode through scrcpy-mask's own exit (hold right-click >= 1s over the game).
+
+        Reconnecting also resets the mode, but it drops the control channel before held touches are
+        released, which leaves the joystick stuck in Android, so it is only a fallback.
+        """
+        if self._mode == "game" or self._busy:
+            return
+        self.set_busy(True)
+        # Hide the bar so the cursor is over scrcpy-mask, not this overlay, when the button goes down.
+        self.hold_hidden = True
+        self.window.setVisible(False)
+        QTimer.singleShot(120, lambda: self.mouse.key(BTN_RIGHT, 1))
+        QTimer.singleShot(120 + 1150, lambda: self.mouse.key(BTN_RIGHT, 0))
+        QTimer.singleShot(120 + 1150 + 600, self._after_hold)
+
+    def _after_hold(self):
+        self.hold_hidden = False
+        self.window.setVisible(self.game_focused)
+        if self._mode == "game":
+            self.set_busy(False)
+            return
+        print("mlbb-controls: right-click exit didn't take, reconnecting", file=sys.stderr, flush=True)
+
+        def reconnect():
+            try:
+                api_post("device/decontrol_device", {"device_id": SERIAL})
+                api_post("device/control_device", {"device_id": SERIAL, "video": False, "audio": False})
+                time.sleep(0.8)
+                # Disconnecting can drop the release of a held touch (e.g. the joystick); cancel any
+                # orphaned touch so it doesn't stay stuck in Android.
+                cancel_android_touches()
+                run_kwin_js("mlbb_focus_once",
+                            'for (const w of workspace.windowList()) if (w.resourceClass === "scrcpy-mask") '
+                            '{ workspace.raiseWindow(w); workspace.activeWindow = w; }\n')
+            except OSError as e:
+                print(f"mlbb-controls: reconnect failed: {e}", file=sys.stderr, flush=True)
+
+        threading.Thread(target=reconnect, daemon=True).start()
+
+    def on_mask_log(self, line):
+        if "Enter raw input mode" in line:
+            self.set_mode("chat")
+            # scrcpy-mask releases nothing when it switches to typing mode, so a direction key held at
+            # that moment leaves the joystick finger down in Android. Cancel it (only for live lines,
+            # not the log history replayed at startup).
+            if line[:26] >= self.started_at:
+                threading.Thread(target=cancel_android_touches, daemon=True).start()
+        elif "Exit raw input mode" in line or "Enter normal mapping mode" in line:
+            self.set_mode("game")
+            self.set_busy(False)
+
+    def on_kwin_log(self, line):
+        if "MLBB_FOCUS in" in line:
+            self.game_focused = True
+            self.window.setVisible(not self.hold_hidden)
+            if self.focus_lost_in_chat:  # scrcpy-mask resets to game controls when it regains focus
+                self.focus_lost_in_chat = False
+                self.set_mode("game")
+        elif "MLBB_FOCUS out" in line:
+            self.game_focused = False
+            self.window.setVisible(False)
+            if self._mode == "chat":
+                self.focus_lost_in_chat = True
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    app = QGuiApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    keys = VirtualInput("mlbb-controls-keys", 0x5678, [KEY_ENTER])
+    mouse = VirtualInput("mlbb-controls-mouse", 0x5679, [BTN_LEFT, BTN_RIGHT], rel_axes=(REL_X, REL_Y))
+    controller = Controller(keys, mouse)
+    engine = QQmlApplicationEngine()
+    # Pin the layer surface to the game monitor; otherwise the compositor picks another output.
+    screen = (next((s for s in app.screens() if s.name() == MONITOR), None)
+              or next((s for s in app.screens() if (s.geometry().width(), s.geometry().height()) == (GAME_W, GAME_H)), None)
+              or app.primaryScreen())
+    engine.rootContext().setContextProperty("controller", controller)
+    engine.rootContext().setContextProperty("targetScreen", screen)
+    engine.loadData(QML.encode())
+    if not engine.rootObjects():
+        sys.exit("failed to load QML (is layer-shell-qt installed?)")
+    controller.window = engine.rootObjects()[0]
+
+    # The KWin journal is replayed first so the last MLBB_FOCUS line sets the initial visibility.
+    procs = [
+        subprocess.Popen(["journalctl", "--user", "-f", "-n", "300", "-o", "cat", "-u", "plasma-kwin_wayland.service"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL),
+        subprocess.Popen(["tail", "-n", "200", "-F", MASK_LOG], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL),
+    ]
+    readers = [LineReader(procs[0], controller.on_kwin_log), LineReader(procs[1], controller.on_mask_log)]  # noqa: F841
+
+    # scrcpy-mask is the game's only taskbar entry, so closing it there (or it crashing) means the
+    # session is over: run the full "mlbb stop" instead of leaving Android and the game window behind.
+    mask_state = {"seen": False, "missing": 0}
+
+    def watch_mask():
+        alive = subprocess.run(["pgrep", "-f", MASK_BIN], capture_output=True).returncode == 0
+        if alive:
+            mask_state["seen"], mask_state["missing"] = True, 0
+        elif mask_state["seen"]:
+            mask_state["missing"] += 1
+            if mask_state["missing"] >= 2:
+                subprocess.Popen(["setsid", "-f", MLBB_BIN, "stop"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                app.quit()
+
+    mask_timer = QTimer()
+    mask_timer.timeout.connect(watch_mask)
+    mask_timer.start(1500)
+
+    threading.Thread(target=stuck_touch_watchdog, args=(controller,), daemon=True).start()
+    try:
+        sys.exit(app.exec())
+    finally:
+        for p in procs:
+            p.terminate()
+        keys.close()
+        mouse.close()
+
+
+if __name__ == "__main__":
+    main()

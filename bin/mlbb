@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# mlbb-linux: play Mobile Legends (and other Waydroid games) on Linux with a
+# keyboard and mouse, the BlueStacks way, on KDE Plasma (Wayland).
+# Usage: mlbb [start|stop|status|setup|config]
+#
+# Everything game-specific lives in a profile (profiles/<name>/), everything
+# machine-specific in ~/.config/mlbb-linux/config.conf. Nothing here is tied to
+# one user, monitor, resolution or IP: paths come from $HOME, the game monitor
+# and the Android serial are auto-detected, and the rest comes from config.
+set -u
+
+# --- locate data + config -----------------------------------------------------
+MLBB_DATA="${MLBB_DATA:-$HOME/.local/share/mlbb-linux}"   # holds profiles/
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mlbb-linux"
+CONFIG="$CONFIG_DIR/config.conf"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mlbb"
+LOG="$STATE_DIR/mlbb.log"
+SAVED_MODE="$STATE_DIR/monitor-mode-before-game"
+KWIN_CODE_DIR="$HOME/.local/share/kwin/scripts/mlbb-focus/contents/code"
+mkdir -p "$STATE_DIR"
+
+# Config defaults, overridden by config.conf if present.
+PROFILE="mlbb"
+MONITOR=""
+REFRESH_MODE="native"
+SERIAL=""
+SCRCPY_MASK_DIR="$HOME/.local/share/scrcpy-mask/app"
+WATCHDOG_IGNORE=""
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+# Load the active game profile.
+PROFILE_DIR="$MLBB_DATA/profiles/$PROFILE"
+if [ -f "$PROFILE_DIR/profile.conf" ]; then
+    . "$PROFILE_DIR/profile.conf"
+fi
+
+# Derived paths (scrcpy-mask's own config locations are fixed by the app).
+MASK_DIR="$SCRCPY_MASK_DIR"
+ADB="$MASK_DIR/assets/platform-tools/adb"
+API="http://127.0.0.1:27799/api"
+MASK_CONFIG_DIR="$HOME/.local/share/com.akichase.scrcpy-mask"
+MASK_CONFIG="$MASK_CONFIG_DIR/config.json"
+MAPPING="${PROFILE}.json"     # active mapping file name inside scrcpy-mask
+GAME_W="${GAME_WIDTH:-1920}"
+GAME_H="${GAME_HEIGHT:-1080}"
+ICON="$HOME/.local/share/waydroid/data/icons/${PKG:-}.png"
+
+# --- monitor detection --------------------------------------------------------
+# Prints "<name> <x> <y>" of the game monitor: the enabled, unrotated
+# GAME_W x GAME_H output (lowest priority wins). If MONITOR is set in config, that
+# connector is used instead. So rearranging or re-plugging monitors needs no edit.
+game_monitor() {
+    kscreen-doctor -j 2>/dev/null | MLBB_W="$GAME_W" MLBB_H="$GAME_H" MLBB_FORCE="$MONITOR" python3 -I -c '
+import json, os, sys
+w, h = int(os.environ["MLBB_W"]), int(os.environ["MLBB_H"])
+force = os.environ.get("MLBB_FORCE") or None
+try:
+    outs = json.load(sys.stdin)["outputs"]
+except Exception:
+    sys.exit(0)
+if force:
+    outs = [o for o in outs if o["name"] == force and o["enabled"]]
+else:
+    outs = [o for o in outs if o["enabled"] and o["rotation"] == 1
+            and (o["size"]["width"], o["size"]["height"]) == (w, h)]
+if outs:
+    o = min(outs, key=lambda o: o["priority"])
+    print(o["name"], o["pos"]["x"], o["pos"]["y"])
+'
+}
+read -r MONITOR_NAME MONITOR_X MONITOR_Y < <(game_monitor) || true
+MONITOR_NAME="${MONITOR_NAME:-${MONITOR:-DP-1}}"
+MONITOR_X="${MONITOR_X:-0}" MONITOR_Y="${MONITOR_Y:-0}"
+export MLBB_MONITOR="$MONITOR_NAME" MLBB_GAME_WIDTH="$GAME_W" MLBB_GAME_HEIGHT="$GAME_H"
+export MLBB_WATCHDOG_IGNORE="$WATCHDOG_IGNORE" MLBB_SCRCPY_MASK_DIR="$MASK_DIR"
+
+# Points the Waydroid window rule and scrcpy-mask's saved position at the game
+# monitor. (The KWin script finds the monitor on its own for the overlay.)
+place_on_monitor() {
+    kwriteconfig6 --file kwinrulesrc --group mlbb-waydroid --key position "$MONITOR_X,$MONITOR_Y"
+    qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1
+    local x=$((MONITOR_X - 2)) y=$((MONITOR_Y - 1))
+    if mask_running; then
+        curl -s -m 3 -X POST "$API/config/update_config" -H 'Content-Type: application/json' \
+            -d "{\"key\":\"horizontal_position\",\"value\":[$x,$y]}" >>"$LOG" 2>&1
+    elif [ -f "$MASK_CONFIG" ]; then
+        python3 -I - "$MASK_CONFIG" "$x" "$y" <<'PY'
+import json, sys
+path, x, y = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+cfg = json.load(open(path))
+if cfg.get("horizontal_position") != [x, y]:
+    cfg["horizontal_position"] = [x, y]
+    json.dump(cfg, open(path, "w"), indent=2)
+PY
+    fi
+}
+
+# Prints "<current mode id> <id of the GAME_W x GAME_H mode closest to 60 Hz>".
+monitor_modes() {
+    kscreen-doctor -j 2>/dev/null | MLBB_W="$GAME_W" MLBB_H="$GAME_H" python3 -I -c '
+import json, os, sys
+w, h = int(os.environ["MLBB_W"]), int(os.environ["MLBB_H"])
+try:
+    outs = json.load(sys.stdin)["outputs"]
+except Exception:
+    sys.exit(0)
+for o in outs:
+    if o["name"] == sys.argv[1]:
+        modes = [m for m in o["modes"] if (m["size"]["width"], m["size"]["height"]) == (w, h)]
+        if modes:
+            best = min(modes, key=lambda m: abs(m["refreshRate"] - 60.0))
+            print(o["currentModeId"], best["id"])
+' "$MONITOR_NAME"
+}
+
+# The game runs at 60 fps; 75 Hz without VRR shows every 4th frame twice (judder).
+monitor_to_60hz() {
+    local cur target
+    read -r cur target < <(monitor_modes) || return 0
+    [ -n "${target:-}" ] && [ "$cur" != "$target" ] || return 0
+    echo "$cur" >"$SAVED_MODE"
+    kscreen-doctor "output.$MONITOR_NAME.mode.$target" >>"$LOG" 2>&1
+}
+monitor_restore() {
+    [ -f "$SAVED_MODE" ] || return 0
+    kscreen-doctor "output.$MONITOR_NAME.mode.$(cat "$SAVED_MODE")" >>"$LOG" 2>&1
+    rm -f "$SAVED_MODE"
+}
+
+say() {
+    echo "$1"
+    echo "[$(date '+%F %T')] $1" >>"$LOG"
+    notify-send -a "${GAME_NAME:-Mobile Legends}" -i "$ICON" "${GAME_NAME:-Mobile Legends}" "$1" 2>/dev/null || true
+}
+fail() { say "$1"; exit 1; }
+
+# Polls a command until it succeeds or the timeout (seconds) runs out.
+wait_for() {
+    local timeout=$1; shift
+    local i
+    for ((i = 0; i < timeout * 2; i++)); do
+        "$@" >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+session_running() { waydroid status 2>/dev/null | grep -q "Session:.*RUNNING"; }
+# While Android boots, `waydroid status` reports the IP as "UNKNOWN"; only accept a real address.
+device_ip() { waydroid status 2>/dev/null | awk -F'\t' '/IP address/ {print $2}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; }
+has_ip() { [ -n "$(device_ip)" ]; }
+# `adb connect` exits 0 even when it fails (adbd still starting), so check the device list and retry.
+adb_connected() { "$ADB" devices 2>/dev/null | grep -q "^$SERIAL[[:space:]]*device$"; }
+booted() {
+    local ip
+    # Honor a pinned SERIAL from config; otherwise follow Waydroid's current IP.
+    if [ -n "$SERIAL" ]; then :; else ip="$(device_ip)" && SERIAL="$ip:5555"; fi
+    adb_connected || "$ADB" connect "$SERIAL" >/dev/null 2>&1
+    adb_connected || return 1
+    [ "$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]
+}
+mask_running() { pgrep -f "$MASK_DIR/scrcpy-mask" >/dev/null; }
+CONTROLS="$HOME/.local/bin/mlbb-controls"
+controls_running() { pgrep -f "$CONTROLS" >/dev/null; }
+mask_api_up() { curl -sf "$API/device/device_list" >/dev/null; }
+mask_controlling() { curl -sf "$API/device/device_list" | grep -q "\"controlled_devices\":\[.*\"device_id\":\"$SERIAL\""; }
+mapping_active() { grep -q "\"active_mapping_file\": \"$MAPPING\"" "$MASK_CONFIG" 2>/dev/null; }
+kwin_script_loaded() { [ "$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded mlbb-focus 2>/dev/null)" = "true" ]; }
+game_running() {
+    { [ -n "${GAME_PROC:-}" ] && "$ADB" -s "$SERIAL" shell pidof "$PKG:$GAME_PROC" >/dev/null 2>&1; } \
+        || "$ADB" -s "$SERIAL" shell ps -A 2>/dev/null | grep -q " $PKG"
+}
+
+start_mask() {
+    # gamemode can't attach to the game (it runs as another user inside Android's
+    # container), so hold it through scrcpy-mask, which lives as long as the session.
+    nohup gamemoderun "$MASK_DIR/run.sh" >>"$LOG" 2>&1 &
+    disown
+}
+start_controls() { MLBB_SERIAL="$SERIAL" nohup "$CONTROLS" >>"$LOG" 2>&1 & disown; }
+connect_mask() {
+    curl -sf -X POST "$API/device/control_device" -H 'Content-Type: application/json' \
+        -d "{\"device_id\":\"$SERIAL\",\"video\":false,\"audio\":false}" >>"$LOG" 2>&1
+}
+activate_mapping() {
+    curl -sf -X POST "$API/mapping/change_active_mapping" -H 'Content-Type: application/json' \
+        -d "{\"file\":\"$MAPPING\"}" >>"$LOG" 2>&1
+}
+
+# Checks every piece, repairing what it can. Prints one line per problem left.
+verify_all() {
+    local problems=()
+    adb_connected || "$ADB" connect "$SERIAL" >/dev/null 2>&1
+    adb_connected || problems+=("Android isn't reachable over ADB ($SERIAL)")
+    if ! mask_running; then start_mask; wait_for 30 mask_api_up; fi
+    mask_api_up || problems+=("scrcpy-mask (keyboard/mouse layer) isn't running")
+    if mask_api_up && ! mask_controlling; then connect_mask; wait_for 15 mask_controlling; fi
+    mask_api_up && ! mask_controlling && problems+=("scrcpy-mask isn't connected to Android")
+    mapping_active || { activate_mapping; sleep 0.5; }
+    mapping_active || problems+=("your key layout ($MAPPING) isn't active")
+    if ! controls_running; then start_controls; sleep 2; fi
+    controls_running || problems+=("the corner buttons / stuck-touch watchdog (mlbb-controls) isn't running")
+    kwin_script_loaded || { qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1; sleep 1; }
+    kwin_script_loaded || problems+=("the KDE taskbar/focus script (mlbb-focus) isn't loaded")
+    game_running || { "$ADB" -s "$SERIAL" shell am start -n "$PKG/$ACTIVITY" >>"$LOG" 2>&1; sleep 3; }
+    game_running || problems+=("${GAME_NAME:-the game} isn't running in Android")
+    local p
+    for p in "${problems[@]}"; do echo "$p"; done
+    [ ${#problems[@]} -eq 0 ]
+}
+
+focus_overlay() {
+    local js="$STATE_DIR/focus-overlay.js"
+    cat >"$js" <<'EOF'
+for (const w of workspace.windowList()) {
+    if (w.resourceClass === "scrcpy-mask") { workspace.raiseWindow(w); workspace.activeWindow = w; }
+}
+EOF
+    local id
+    id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" mlbb_focus_once 2>/dev/null) || return 0
+    qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run >/dev/null 2>&1
+    sleep 0.5
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript mlbb_focus_once >/dev/null 2>&1
+}
+
+require_setup() {
+    [ -f "$CONFIG" ] && [ -f "$PROFILE_DIR/profile.conf" ] && return 0
+    fail "Not set up yet. Run: mlbb setup"
+}
+
+start() {
+    require_setup
+    systemctl is-active --quiet waydroid-container || fail "Waydroid's container service isn't running (systemctl status waydroid-container)."
+
+    # Android reads the refresh rate only at boot, so set it before starting.
+    [ "$REFRESH_MODE" = "60" ] && monitor_to_60hz
+    place_on_monitor
+    say "Starting Android..."
+    nohup waydroid show-full-ui >>"$LOG" 2>&1 &
+    disown
+    session_running || wait_for 60 session_running || fail "Android session didn't start. See $LOG"
+
+    if [ -z "$SERIAL" ]; then
+        wait_for 90 has_ip || fail "Android never got a network address. See $LOG"
+        SERIAL="$(device_ip):5555"
+    fi
+    wait_for 180 booted || fail "Android didn't finish booting (ADB: $("$ADB" devices 2>&1 | tr '\n' ' ')). See $LOG"
+    export MLBB_SERIAL="$SERIAL"
+
+    # Per-boot Android tuning (all reset on every Android boot).
+    "$ADB" -s "$SERIAL" shell setprop debug.stagefright.ccodec 4      # smoother multi-threaded video
+    "$ADB" -s "$SERIAL" shell setprop debug.egl.force_msaa true
+    if [ -n "${RENDER_WIDTH:-}" ]; then
+        "$ADB" -s "$SERIAL" shell wm size "${RENDER_WIDTH}x${RENDER_HEIGHT}"   # supersample
+        [ -n "${DENSITY:-}" ] && "$ADB" -s "$SERIAL" shell wm density "$DENSITY"
+    fi
+    # No assistant: a stray Meta press otherwise opens Google Assistant over the game and dims it.
+    "$ADB" -s "$SERIAL" shell settings put secure assistant '""'
+    "$ADB" -s "$SERIAL" shell settings put secure voice_interaction_service '""'
+
+    mask_running || start_mask
+    wait_for 30 mask_api_up || fail "scrcpy-mask didn't start. See $LOG"
+    controls_running || start_controls
+    if ! mask_controlling; then
+        connect_mask
+        wait_for 15 mask_controlling || fail "scrcpy-mask couldn't connect to Android. See $LOG"
+    fi
+    activate_mapping
+
+    "$ADB" -s "$SERIAL" shell am start -n "$PKG/$ACTIVITY" >>"$LOG" 2>&1
+    local n
+    for n in 1 2 3; do sleep 2; focus_overlay; done
+
+    local problems
+    if ! problems="$(verify_all)"; then
+        fail "Started, but something is missing: $(echo "$problems" | paste -sd ';' | sed 's/;/; /g'). Run \"mlbb start\" again or see $LOG"
+    fi
+    focus_overlay
+    say "Ready: game, keys, corner buttons and taskbar fix are all running."
+}
+
+stop() {
+    say "Closing ${GAME_NAME:-the game}, keymapper and Android..."
+    local ip="${SERIAL%%:*}"
+    [ -z "$ip" ] && ip="$(device_ip)"
+    [ -n "$ip" ] && "$ADB" -s "$ip:5555" shell am force-stop "$PKG" >/dev/null 2>&1
+    # The controls helper runs "mlbb stop" itself when scrcpy-mask disappears, so stop it first.
+    pkill -f "$CONTROLS" 2>/dev/null
+    pkill -f "$MASK_DIR/scrcpy-mask" 2>/dev/null
+    waydroid session stop >>"$LOG" 2>&1
+    monitor_restore
+    say "Stopped."
+}
+
+status() {
+    require_setup
+    local ip ok="yes" no="NO"
+    ip="${SERIAL:-$(device_ip):5555}"; ip="${ip%%:*}"
+    SERIAL="${SERIAL:-${ip:-none}:5555}"
+    printf '%-28s %s\n' "profile" "$PROFILE (${GAME_NAME:-?}, ${GAME_W}x${GAME_H})"
+    printf '%-28s %s\n' "game monitor" "$MONITOR_NAME @ $MONITOR_X,$MONITOR_Y"
+    printf '%-28s %s\n' "Android session" "$(session_running && echo running || echo stopped)"
+    printf '%-28s %s\n' "Android IP / ADB" "${ip:-unknown} / $(adb_connected && echo connected || echo "not connected")"
+    printf '%-28s %s\n' "game running" "$(game_running && echo $ok || echo $no)"
+    printf '%-28s %s\n' "scrcpy-mask (keys)" "$(mask_running && echo running || echo stopped), $(mask_controlling && echo connected || echo "not connected")"
+    printf '%-28s %s\n' "key layout active" "$(mapping_active && echo $ok || echo $no)"
+    printf '%-28s %s\n' "corner buttons + watchdog" "$(controls_running && echo running || echo stopped)"
+    printf '%-28s %s\n' "KDE taskbar/focus script" "$(kwin_script_loaded && echo loaded || echo "NOT loaded")"
+    if adb_connected; then
+        printf '%-28s %s\n' "codec2 / msaa" "$("$ADB" -s "$SERIAL" shell getprop debug.stagefright.ccodec 2>/dev/null | tr -d '\r') / $("$ADB" -s "$SERIAL" shell getprop debug.egl.force_msaa 2>/dev/null | tr -d '\r')"
+        printf '%-28s %s\n' "render size" "$("$ADB" -s "$SERIAL" shell wm size 2>/dev/null | tail -1 | tr -d '\r')"
+    fi
+}
+
+# Per-machine wiring: copy the profile's mapping into scrcpy-mask, render the KWin
+# script at the profile's resolution, and make sure a config exists. Safe to re-run.
+setup() {
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$CONFIG" ]; then
+        cp "$MLBB_DATA/config.example.conf" "$CONFIG"
+        say "Wrote a starter config at $CONFIG"
+    fi
+    [ -f "$PROFILE_DIR/profile.conf" ] || fail "Profile '$PROFILE' not found in $MLBB_DATA/profiles/"
+
+    # Mapping into scrcpy-mask's own mapping dir, named <profile>.json.
+    mkdir -p "$MASK_CONFIG_DIR/mapping"
+    cp "$PROFILE_DIR/mapping.json" "$MASK_CONFIG_DIR/mapping/$MAPPING"
+    echo "Installed key layout: $MASK_CONFIG_DIR/mapping/$MAPPING"
+
+    # Render the KWin script at this profile's resolution, if a template is present.
+    if [ -f "$KWIN_CODE_DIR/main.js.in" ]; then
+        sed -e "s/@@GAME_WIDTH@@/$GAME_W/g" -e "s/@@GAME_HEIGHT@@/$GAME_H/g" \
+            "$KWIN_CODE_DIR/main.js.in" > "$KWIN_CODE_DIR/main.js"
+        echo "Rendered KWin script for ${GAME_W}x${GAME_H}"
+    fi
+
+    echo
+    echo "Detected now:"
+    echo "  game monitor : $MONITOR_NAME @ $MONITOR_X,$MONITOR_Y  (${GAME_W}x${GAME_H})"
+    echo "  Android      : $(has_ip && echo "$(device_ip):5555" || echo "not running (auto-detected at start)")"
+    echo
+    echo "Edit anything with: mlbb config edit"
+    echo "Then launch with:   mlbb start"
+}
+
+config_cmd() {
+    case "${1:-show}" in
+        show)
+            echo "config file : $CONFIG"
+            [ -f "$CONFIG" ] && { echo "---"; cat "$CONFIG"; echo "---"; }
+            echo "resolved:"
+            echo "  PROFILE=$PROFILE  GAME=${GAME_W}x${GAME_H}  REFRESH_MODE=$REFRESH_MODE"
+            echo "  MONITOR=$MONITOR_NAME @ $MONITOR_X,$MONITOR_Y"
+            echo "  SERIAL=${SERIAL:-auto ($(has_ip && echo "$(device_ip):5555" || echo "none yet"))}"
+            echo "  SCRCPY_MASK_DIR=$MASK_DIR"
+            ;;
+        edit) "${EDITOR:-nano}" "$CONFIG" ;;
+        path) echo "$CONFIG" ;;
+        *) echo "Usage: mlbb config [show|edit|path]"; exit 2 ;;
+    esac
+}
+
+case "${1:-start}" in
+    start) start ;;
+    stop) stop ;;
+    status) status ;;
+    setup) setup ;;
+    config) shift; config_cmd "$@" ;;
+    *) echo "Usage: mlbb [start|stop|status|setup|config]"; exit 2 ;;
+esac
