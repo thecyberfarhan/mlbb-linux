@@ -122,14 +122,6 @@ same convenience BlueStacks provides. It does not automate gameplay.
 Mobile Legends is the one that is tested; see [docs/PROFILES.md](docs/PROFILES.md)
 to add another.
 
-## Author
-
-Built by **Farhan Hussain**, a cybersecurity student and penetration tester.
-
-- Portfolio: https://thecyberfarhan.github.io
-- LinkedIn: https://www.linkedin.com/in/cyber-farhan-hussain/
-- GitHub: https://github.com/thecyberfarhan
-
 ## Credits and license
 
 Stands on [Waydroid](https://waydro.id/),
