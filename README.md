@@ -1,11 +1,10 @@
-# mlbb-linux: Mobile Legends on Linux with keyboard and mouse
+# mlbb-linux
 
-Play **Mobile Legends: Bang Bang (MLBB) on Linux with a keyboard and mouse**, the
-way an emulator like BlueStacks does it on Windows. It runs the Android game in
-[Waydroid](https://waydro.id/) and maps WASD to the joystick, keys to the on-screen
-skills, and the mouse to touch, with a launcher, a clean KDE desktop integration,
-and a watchdog that unsticks the joystick. BlueStacks has no Linux build, and
-Waydroid on its own has no keymapper, so this fills that gap.
+> Play Mobile Legends: Bang Bang (MLBB) on Linux with a keyboard and mouse, the way an emulator like BlueStacks does it on Windows: the Android game in Waydroid, WASD on the joystick, keys on the skills, the mouse as touch, with full KDE Plasma integration.
+
+It runs the game in [Waydroid](https://waydro.id/) with a launcher, a clean KDE
+desktop integration, and a watchdog that unsticks the joystick. BlueStacks has no
+Linux build, and Waydroid on its own has no keymapper, so this fills that gap.
 
 Built and tested on **Arch Linux with KDE Plasma 6 (Wayland)**. Mobile Legends is
 the tested profile; the layout is profile-based, so other Waydroid games can be
@@ -14,6 +13,16 @@ added.
 > Convenience input remapping only (keyboard and mouse to touch), the same idea as
 > BlueStacks. It is **not** a macro tool or a bot: one key maps to one tap. Keep it
 > that way to stay within Mobile Legends' rules.
+
+## At a glance
+
+| | |
+|---|---|
+| Kind | Personal |
+| Status | Public |
+| Language | Bash, Python |
+| Requires | Arch Linux, KDE Plasma (Wayland), Waydroid |
+| License | MIT |
 
 ## What you get
 
